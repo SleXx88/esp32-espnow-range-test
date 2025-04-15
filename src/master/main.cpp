@@ -14,10 +14,20 @@ typedef struct __attribute__((packed)) {
   uint32_t packetId;
 } DataPacket;
 
+// Globale Variable für RSSI
+int8_t lastRSSI = 0;
+
+// Promiscuous Callback für RSSI
+void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (type == WIFI_PKT_MGMT || type == WIFI_PKT_DATA) {
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    lastRSSI = pkt->rx_ctrl.rssi;  // RSSI-Wert speichern
+  }
+}
+
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (len != sizeof(DataPacket)) return;
 
-  int8_t rssi = WiFi.RSSI();  // Näherung
   DataPacket rx;
   memcpy(&rx, incomingData, sizeof(rx));
 
@@ -26,7 +36,7 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     Serial.printf("%02X", mac[i]);
     if (i < 5) Serial.print(":");
   }
-  Serial.printf(" | RSSI: %d dBm | Paket #%lu\n", rssi, rx.packetId);
+  Serial.printf(" | RSSI: %d dBm | Paket #%lu\n", lastRSSI, rx.packetId);
 
   neopixelWrite(RGB_BUILTIN, 0, RGB_BRIGHTNESS, 0);  // Grün
   delay(100);
@@ -45,6 +55,10 @@ void setup() {
 
   esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_max_tx_power(SEND_POWER * 4);  // in 0.25 dBm Schritten
+
+  // Promiscuous-Modus aktivieren
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW Init fehlgeschlagen");
