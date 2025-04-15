@@ -32,4 +32,4 @@ ESP-NOW is a lightweight, connectionless wireless communication protocol develop
 
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/yourusername/esp32-espnow-range-test.git
+   git clone https://github.com/SleXx88/esp32-espnow-range-test.git
