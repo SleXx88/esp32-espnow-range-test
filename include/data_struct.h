@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 // Größe des Daten-Payloads nach Bedarf
-#define PAYLOAD_SIZE 200
+#define PAYLOAD_SIZE 230
 
 // Mögliche Pakettypen im Protokoll
 enum PacketType : uint8_t {
