@@ -2,94 +2,219 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
+// ---------- Konfiguration -------------
 #define CHANNEL 1
-#define SEND_POWER 8
-#define RGB_BRIGHTNESS 64
+#define SEND_POWER 8               // 8 bedeutet 8 * 0,25 dBm = 2 dBm. Anpassen nach Bedarf.
+#define REPORT_INTERVAL_MS 1000    // Auswertung alle 1 Sekunde
+// --------------------------------------
 
-static const uint8_t BROADCAST_ADDR[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+#include "crc32_util.h"  // Oder direkt computeCRC32(...) hier reinkopieren
+#include "data_struct.h" // Hier ist PacketType, DataPacket etc. definiert
 
-uint32_t packetCounter = 0;
+static const uint8_t BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+uint8_t slaveMac[6];              // Nach Handshake hier speichern
+bool handshakeDone = false;
 
-typedef struct __attribute__((packed)) {
-  uint32_t packetId;
-} DataPacket;
+// Statistik
+uint32_t sentPacketsThisInterval     = 0;
+uint32_t receivedPacketsThisInterval = 0;
+uint32_t lastReportTime              = 0;
 
-// Globale Variable für RSSI
-int8_t lastRSSI = 0;
+// RSSI-Erfassung
+int8_t  lastRSSI = 0;
+int32_t rssiSum  = 0;
+uint32_t rssiCount = 0;
 
-// Promiscuous Callback für RSSI
+static uint32_t getDynamicSendInterval() {
+  uint32_t interval = PAYLOAD_SIZE / 10;
+  if (interval < 10) interval = 10;
+  return interval;
+}
+
+static uint32_t getDynamicWaitTime() {
+  // Nur nötig, wenn Sie sie aufrufen
+  return 3 * getDynamicSendInterval();
+}
+
+// Callback für Promiscuous-Mode
 void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (type == WIFI_PKT_MGMT || type == WIFI_PKT_DATA) {
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    lastRSSI = pkt->rx_ctrl.rssi;  // RSSI-Wert speichern
+    lastRSSI = pkt->rx_ctrl.rssi;
   }
 }
 
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-  if (len != sizeof(DataPacket)) return;
+// Callback: Daten empfangen
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (len < (int)sizeof(DataPacket)) {
+    // Unerwartete Paketgröße
+    return;
+  }
 
   DataPacket rx;
   memcpy(&rx, incomingData, sizeof(rx));
 
-  Serial.print("Antwort empfangen von ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", mac[i]);
-    if (i < 5) Serial.print(":");
+  // CRC prüfen
+  uint32_t calcCrc = computeCRC32((uint8_t *)&rx, sizeof(rx) - sizeof(rx.crc));
+  if (calcCrc != rx.crc) {
+    // Paket korrupt
+    Serial.println("CRC-Fehler im empfangenen Paket.");
+    return;
   }
-  Serial.printf(" | RSSI: %d dBm | Paket #%lu\n", lastRSSI, rx.packetId);
 
-  neopixelWrite(RGB_BUILTIN, 0, RGB_BRIGHTNESS, 0);  // Grün
-  delay(100);
-  neopixelWrite(RGB_BUILTIN, 0, 0, 0);  // Aus
+  switch (rx.type) {
+    case PACKET_TYPE_HANDSHAKE_ACK:
+      // Slave hat geantwortet, MAC übernehmen
+      Serial.println("Handshake ACK empfangen!");
+      // MAC aus dem Callback entnehmen
+      memcpy(slaveMac, mac, 6);
+      handshakeDone = true;
+
+      // Peer mit Slave-MAC hinzufügen (Unicast)
+      {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, slaveMac, 6);
+        peerInfo.channel   = CHANNEL;
+        peerInfo.encrypt   = false;
+        peerInfo.ifidx     = WIFI_IF_STA;
+
+        esp_now_del_peer(slaveMac); // Vorsichtshalber löschen, falls existiert
+        esp_now_add_peer(&peerInfo);
+
+        Serial.printf("Slave-MAC gesetzt: %02X:%02X:%02X:%02X:%02X:%02X\n",
+            slaveMac[0], slaveMac[1], slaveMac[2], 
+            slaveMac[3], slaveMac[4], slaveMac[5]);
+      }
+      break;
+
+    case PACKET_TYPE_TEST:
+      // Dies ist die Antwort vom Slave im normalen Test-Betrieb
+      receivedPacketsThisInterval++;
+      rssiSum   += lastRSSI;
+      rssiCount += 1;
+      break;
+
+    default:
+      // Andere Packet-Typen hier verarbeiten
+      break;
+  }
 }
 
+// Setup
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  pinMode(RGB_BUILTIN, OUTPUT);
-  neopixelWrite(RGB_BUILTIN, 0, 0, 0);
-
+  // WLAN + ESP-NOW
   WiFi.mode(WIFI_STA);
   esp_wifi_start();
 
+  // Kanal und Sendeleistung
   esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_max_tx_power(SEND_POWER * 4);  // in 0.25 dBm Schritten
+  esp_wifi_set_max_tx_power(SEND_POWER * 4);
 
-  // Promiscuous-Modus aktivieren
+  // RSSI via Promiscuous
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW Init fehlgeschlagen");
+    Serial.println("ESP-NOW Init fehlgeschlagen.");
     return;
   }
+  esp_now_register_recv_cb(onDataRecv);
 
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, BROADCAST_ADDR, 6);
-  peerInfo.channel = CHANNEL;
-  peerInfo.encrypt = false;
-  peerInfo.ifidx = WIFI_IF_STA;
-  esp_now_add_peer(&peerInfo);
+  // Broadcast-Peer hinzufügen (für Handshake)
+  {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, BROADCAST_ADDR, 6);
+    peerInfo.channel   = CHANNEL;
+    peerInfo.encrypt   = false;
+    peerInfo.ifidx     = WIFI_IF_STA;
+    esp_now_add_peer(&peerInfo);
+  }
 
-  esp_now_register_recv_cb(OnDataRecv);
-
-  Serial.println("Master bereit.");
+  Serial.println("Master bereit. Versuche Handshake per Broadcast...");
 }
 
 void loop() {
-  DataPacket packet = { packetCounter++ };
+  uint32_t now = millis();
 
-  neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0);  // Rot
-  esp_err_t result = esp_now_send(BROADCAST_ADDR, (uint8_t *)&packet, sizeof(packet));
-  delay(100);
-  neopixelWrite(RGB_BUILTIN, 0, 0, 0);  // Aus
+  // --- Handshake-Phase ---
+  if (!handshakeDone) {
+    // Regelmäßig ein Handshake-Paket broadcasten, bis Slave antwortet
+    static uint32_t lastHandshakeSend = 0;
+    if (now - lastHandshakeSend > 500) {  // alle 500ms
+      DataPacket pkt;
+      memset(&pkt, 0, sizeof(pkt));
+      pkt.type     = PACKET_TYPE_HANDSHAKE;
+      pkt.packetId = 0; // kann beliebig sein
+      // Payload füllen (optional)
+      for (int i=0; i<PAYLOAD_SIZE; i++) {
+        pkt.payload[i] = 0xAA; // Testdaten
+      }
+      pkt.crc = computeCRC32((uint8_t*)&pkt, sizeof(pkt) - sizeof(pkt.crc));
 
-  if (result == ESP_OK) {
-    Serial.printf("Ping #%lu gesendet\n", packet.packetId);
-  } else {
-    Serial.printf("Senden fehlgeschlagen: %d\n", result);
+      esp_err_t err = esp_now_send(BROADCAST_ADDR, (uint8_t*)&pkt, sizeof(pkt));
+      if (err == ESP_OK) {
+        Serial.println("Handshake-Paket gesendet (Broadcast)...");
+      } else {
+        Serial.printf("Fehler beim Senden des Handshake-Pakets: %d\n", err);
+      }
+      lastHandshakeSend = now;
+    }
+
+    // Solange Handshake nicht fertig, kein Testbetrieb
+    return;
   }
 
-  delay(900);
+  // --- Ab hier: Test-Betrieb (Ping-Pong mit dem Slave) ---
+
+  static uint32_t lastSend = 0;
+  uint32_t sendInterval = getDynamicSendInterval();
+  if (now - lastSend >= sendInterval) {
+    // Neues Test-Paket an Slave senden
+    static uint32_t packetCounter = 1;
+    
+    DataPacket pkt;
+    pkt.type     = PACKET_TYPE_TEST;
+    pkt.packetId = packetCounter++;
+    // Beispiel: Payload mit irgendwelchen Daten füllen
+    for (int i = 0; i < PAYLOAD_SIZE; i++) {
+      pkt.payload[i] = (uint8_t)(pkt.packetId + i);
+    }
+    pkt.crc = computeCRC32((uint8_t*)&pkt, sizeof(pkt) - sizeof(pkt.crc));
+
+    esp_err_t err = esp_now_send(slaveMac, (uint8_t*)&pkt, sizeof(pkt));
+    if (err == ESP_OK) {
+      sentPacketsThisInterval++;
+    } else {
+      Serial.printf("Fehler beim Senden des Testpakets: %d\n", err);
+    }
+    
+    lastSend = now;
+  }
+
+  // Auswertung in festen Intervallen
+  if (now - lastReportTime >= REPORT_INTERVAL_MS) {
+    float loss = 0.0f;
+    if (sentPacketsThisInterval > 0) {
+      loss = 100.0f * (sentPacketsThisInterval - receivedPacketsThisInterval)
+                       / sentPacketsThisInterval;
+    }
+    float avgRSSI = (rssiCount > 0) ? (float)rssiSum / rssiCount : 0.0f;
+
+    Serial.println("=== Verbindungstest ===");
+    Serial.printf("Gesendet:    %lu\n", sentPacketsThisInterval);
+    Serial.printf("Empfangen:   %lu\n", receivedPacketsThisInterval);
+    Serial.printf("Verlust:     %.2f %%\n", loss);
+    Serial.printf("Durchschn. RSSI: %.2f dBm\n", avgRSSI);
+
+    // Reset der Zähler
+    sentPacketsThisInterval = 0;
+    receivedPacketsThisInterval = 0;
+    rssiSum  = 0;
+    rssiCount = 0;
+
+    lastReportTime = now;
+  }
 }
