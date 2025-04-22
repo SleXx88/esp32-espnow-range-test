@@ -1,48 +1,45 @@
-#ifndef DATA_STRUCT_H
-#define DATA_STRUCT_H
-
+#pragma once
 #include <stdint.h>
 
-// Mögliche PacketTypes
-enum PacketType : uint8_t {
-    PACKET_TYPE_HANDSHAKE      = 1, // Master -> Broadcast
-    PACKET_TYPE_HANDSHAKE_ACK  = 2, // Slave -> Master
-    PACKET_TYPE_TEST           = 3, // Ping-Pong
-    PACKET_TYPE_CONFIG         = 4, // Master -> Slave (Parameter ändern)
-    PACKET_TYPE_CONFIG_ACK     = 5  // Slave -> Master (Bestätigung)
-};
+/* ESP‑NOW‑Grenzen */
+#define DATA_OVERHEAD  9
+#define PAYLOAD_MAX    241
 
-// Falls der Master mit #define PAYLOAD_SIZE X in main.cpp kommt, 
-// sonst Default 200:
-#ifndef PAYLOAD_SIZE
-  #define PAYLOAD_SIZE 200
+/* 1‑Byte‑Packing */
+#ifdef __GNUC__
+  #define PACKED __attribute__((packed))
+#else
+  #define PACKED
 #endif
 
-#pragma pack(push, 1)
-typedef struct {
-    PacketType type;
-    uint32_t   packetId;
-    uint8_t    payload[PAYLOAD_SIZE];
-    uint32_t   crc;
+typedef enum : uint8_t {
+  PACKET_TYPE_HANDSHAKE       = 1,
+  PACKET_TYPE_HANDSHAKE_ACK   = 2,
+  PACKET_TYPE_CONFIG          = 3,
+  PACKET_TYPE_CONFIG_ACK      = 4,
+  PACKET_TYPE_CONFIG_COMMIT   = 5,
+  PACKET_TYPE_CONFIG_DONE     = 6,
+  PACKET_TYPE_TEST            = 7
+} PacketType;
+
+/* Handshake & Test */
+typedef struct PACKED {
+  uint8_t  type;
+  uint32_t id;
+  uint8_t  payload[PAYLOAD_MAX];
+  uint32_t crc;
 } DataPacket;
 
-// Master -> Slave
-typedef struct {
-    PacketType type;       // PACKET_TYPE_CONFIG
-    uint8_t    channel;    // Neuer Kanal [1..13]
-    uint8_t    txPower;    // [1..80] => 0.25 * txPower = dBm
-    uint16_t   paySize;    // [1..250]
-    uint32_t   crc;
+/* Config, ACK, Commit, Done */
+typedef struct PACKED {
+  uint8_t  type;
+  uint8_t  channel;
+  uint8_t  txPower;
+  uint16_t paySize;
+  uint32_t crc;
 } ConfigPacket;
 
-// Slave -> Master
-typedef struct {
-    PacketType type;       // PACKET_TYPE_CONFIG_ACK
-    uint8_t    channel;    // Bestätigter Kanal
-    uint8_t    txPower;    // Bestätigte Sendeleistung
-    uint16_t   paySize;    // Bestätigte Payload-Größe
-    uint32_t   crc;
-} ConfigAckPacket;
-#pragma pack(pop)
-
-#endif // DATA_STRUCT_H
+/* Alias‑Typen */
+typedef ConfigPacket ConfigAckPacket;
+typedef ConfigPacket ConfigCommitPacket;
+typedef ConfigPacket ConfigDonePacket;

@@ -4,156 +4,97 @@
 #include "crc32_util.h"
 #include "data_struct.h"
 
-// ----------------------------
-// Slave Startwerte
-// ----------------------------
+#define DEFAULT_TXPWR 40
 static uint8_t  gChannel = 1;
-static uint8_t  gTxPower = 8;   // => 2 dBm
-static uint16_t gPaySize = PAYLOAD_SIZE; // Default 200
+static uint8_t  gTxPower = DEFAULT_TXPWR;
+static uint16_t gPaySize = PAYLOAD_MAX;
 
-// ----------------------------
-
-static uint8_t masterMac[6];
-static bool    handshakeDone = false;
-
-void applySlaveSettings() {
-  esp_wifi_set_channel(gChannel, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_max_tx_power(gTxPower * 4);
+#ifndef RGB_BUILTIN
+  #define RGB_BUILTIN 48
+#endif
+void flashLED(){
+  neopixelWrite(RGB_BUILTIN,255,0,0);
+  delayMicroseconds(400);
+  neopixelWrite(RGB_BUILTIN,0,0,0);
 }
 
-// Callback: Daten empfangen
-void onDataRecv(const uint8_t* mac, const uint8_t* data, int len)
-{
-  if (len <= 0) return;
-  PacketType ptype = (PacketType)data[0];
+uint8_t masterMac[6];
+bool    linkOK=false;
 
-  if (ptype == PACKET_TYPE_HANDSHAKE) {
-    // Master -> Broadcast
-    if (len < (int)sizeof(DataPacket)) return;
-    DataPacket rx;
-    memcpy(&rx, data, sizeof(rx));
-    uint32_t c = computeCRC32((uint8_t*)&rx, sizeof(rx) - sizeof(rx.crc));
-    if (c != rx.crc) {
-      Serial.println("[Slave] CRC-Fehler im HANDSHAKE-Paket");
-      return;
-    }
-    Serial.println("[Slave] Handshake-Paket erhalten!");
-    handshakeDone = true;
-    memcpy(masterMac, mac, 6);
+void applyWiFi(){
+  esp_wifi_set_channel(gChannel,WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_max_tx_power(gTxPower);
+}
 
-    // Peer anlegen
-    if (!esp_now_is_peer_exist(mac)) {
-      esp_now_peer_info_t pi = {};
-      memcpy(pi.peer_addr, mac, 6);
-      pi.channel = gChannel;
-      pi.encrypt = false;
-      pi.ifidx   = WIFI_IF_STA;
-      esp_now_add_peer(&pi);
-    }
+void onRecv(const uint8_t* mac,const uint8_t* d,int len){
+  if(len<=0) return;
+  PacketType tp=(PacketType)d[0];
 
-    // Ack
-    DataPacket ack;
-    memset(&ack, 0, sizeof(ack));
-    ack.type     = PACKET_TYPE_HANDSHAKE_ACK;
-    ack.packetId = 0;
-    for (int i=0; i<PAYLOAD_SIZE; i++) {
-      ack.payload[i] = 0x55;
-    }
-    ack.crc = computeCRC32((uint8_t*)&ack, sizeof(ack) - sizeof(ack.crc));
-    esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
-    Serial.println("[Slave] Handshake-ACK an Master gesendet.");
+  if(tp==PACKET_TYPE_HANDSHAKE && len==sizeof(DataPacket)){
+    const DataPacket* p=(const DataPacket*)d;
+    if(computeCRC32((uint8_t*)p,len-sizeof(p->crc))!=p->crc) return;
+    gChannel=p->payload[0];
+    gTxPower=p->payload[1];
+    gPaySize =p->payload[2]|(p->payload[3]<<8);
+    applyWiFi();
+    memcpy(masterMac,mac,6);
+    linkOK=true;
+    esp_now_peer_info_t pi{}; memcpy(pi.peer_addr,mac,6);
+    pi.channel=gChannel; esp_now_add_peer(&pi);
+    DataPacket ack{PACKET_TYPE_HANDSHAKE_ACK,0};
+    memcpy(ack.payload,p->payload,4);
+    ack.crc=computeCRC32((uint8_t*)&ack,sizeof(ack)-sizeof(ack.crc));
+    esp_now_send(mac,(uint8_t*)&ack,sizeof(ack));
+    Serial.printf("HS OK  CH=%d TX=%d SZ=%d\n",gChannel,gTxPower,gPaySize);
   }
-  else if (ptype == PACKET_TYPE_CONFIG) {
-    // Master möchte Kanal/TxPower/Payload ändern
-    if (len < (int)sizeof(ConfigPacket)) return;
-    ConfigPacket cfg;
-    memcpy(&cfg, data, sizeof(cfg));
-    uint32_t c = computeCRC32((uint8_t*)&cfg, sizeof(cfg) - sizeof(cfg.crc));
-    if (c != cfg.crc) {
-      Serial.println("[Slave] CRC-Fehler im CONFIG-Paket");
-      return;
-    }
-    Serial.printf("[Slave] ConfigPacket empfangen: CH=%d, TX=%d(%.2f dBm), SIZE=%d\n",
-                  cfg.channel, cfg.txPower, 0.25f*cfg.txPower, cfg.paySize);
-
-    // Zuerst Ack senden (PACKET_TYPE_CONFIG_ACK),
-    // damit der Master es noch auf dem alten Kanal empfangen kann.
-    ConfigAckPacket ack;
-    ack.type    = PACKET_TYPE_CONFIG_ACK;
-    ack.channel = cfg.channel;
-    ack.txPower = cfg.txPower;
-    ack.paySize = cfg.paySize;
-    ack.crc     = computeCRC32((uint8_t*)&ack, sizeof(ack) - sizeof(ack.crc));
-    esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
-    Serial.println("[Slave] ConfigAck an Master gesendet.");
-
-    // Jetzt wendet der Slave die neuen Werte an
-    gChannel = cfg.channel;
-    gTxPower = cfg.txPower;
-    gPaySize = cfg.paySize;
-
-    // Peer updaten
-    if (esp_now_is_peer_exist(mac)) {
-      esp_now_peer_info_t pi = {};
-      memcpy(pi.peer_addr, mac, 6);
-      pi.channel = gChannel;
-      pi.encrypt = false;
-      pi.ifidx   = WIFI_IF_STA;
-      esp_now_del_peer(mac);
-      esp_now_add_peer(&pi);
-    }
-
-    applySlaveSettings();
-    Serial.println("[Slave] Neue Einstellungen uebernommen!");
+  else if(tp==PACKET_TYPE_CONFIG && len>=sizeof(ConfigPacket)){
+    const ConfigPacket* c=(const ConfigPacket*)d;
+    if(computeCRC32((uint8_t*)c,len-sizeof(c->crc))!=c->crc) return;
+    ConfigAckPacket ack{PACKET_TYPE_CONFIG_ACK,c->channel,c->txPower,c->paySize,0};
+    ack.crc=computeCRC32((uint8_t*)&ack,sizeof(ack)-sizeof(ack.crc));
+    esp_now_send(mac,(uint8_t*)&ack,sizeof(ack));
+    Serial.printf("ACK rcv  CH=%d TX=%d SZ=%d\n",c->channel,c->txPower,c->paySize);
   }
-  else if (ptype == PACKET_TYPE_TEST) {
-    // Ping-Pong
-    if (len < (int)sizeof(DataPacket)) return;
-    DataPacket rx;
-    memcpy(&rx, data, sizeof(rx));
-    uint32_t c = computeCRC32((uint8_t*)&rx, sizeof(rx) - sizeof(rx.crc));
-    if (c != rx.crc) {
-      Serial.println("[Slave] CRC-Fehler im TEST-Paket");
+  else if(tp==PACKET_TYPE_CONFIG_COMMIT && len>=sizeof(ConfigPacket)){
+    // Debug: prüfen, ob Commit ankommt
+    const ConfigPacket* c=(const ConfigPacket*)d;
+    Serial.printf("[Slave] COMMIT rcv type=%u ch=%u tx=%u sz=%u len=%d\n",
+                  c->type,c->channel,c->txPower,c->paySize,len);
+    if(computeCRC32((uint8_t*)c,len-sizeof(c->crc))!=c->crc){
+      Serial.println("[Slave] COMMIT CRC ERR");
       return;
     }
-    // Antwort
-    if (!esp_now_is_peer_exist(mac)) {
-      esp_now_peer_info_t pi = {};
-      memcpy(pi.peer_addr, mac, 6);
-      pi.channel = gChannel;
-      pi.encrypt = false;
-      pi.ifidx   = WIFI_IF_STA;
-      esp_now_add_peer(&pi);
-    }
-    DataPacket tx = rx;
-    tx.crc = computeCRC32((uint8_t*)&tx, sizeof(tx) - sizeof(tx.crc));
-    esp_now_send(mac, (uint8_t*)&tx, sizeof(tx));
+    gChannel=c->channel; gTxPower=c->txPower; gPaySize=c->paySize;
+    applyWiFi();
+    Serial.printf("[Slave] Applying new config: CH=%d TX=%d SZ=%d\n",
+                  gChannel,gTxPower,gPaySize);
+    esp_now_del_peer(mac);
+    esp_now_peer_info_t pi{}; memcpy(pi.peer_addr,mac,6);
+    pi.channel=gChannel; esp_now_add_peer(&pi);
+    ConfigDonePacket done{PACKET_TYPE_CONFIG_DONE,gChannel,gTxPower,gPaySize,0};
+    done.crc=computeCRC32((uint8_t*)&done,sizeof(done)-sizeof(done.crc));
+    esp_err_t e=esp_now_send(mac,(uint8_t*)&done,sizeof(done));
+    Serial.printf("[Slave] CONFIG_DONE send err=%d\n",e);
+  }
+  else if(tp==PACKET_TYPE_TEST && len==sizeof(DataPacket)){
+    const DataPacket* p=(const DataPacket*)d;
+    if(computeCRC32((uint8_t*)p,len-sizeof(p->crc))!=p->crc) return;
+    flashLED();
+    DataPacket rsp=*p;
+    rsp.crc=computeCRC32((uint8_t*)&rsp,sizeof(rsp)-sizeof(rsp.crc));
+    esp_now_send(mac,(uint8_t*)&rsp,sizeof(rsp));
   }
 }
 
-void setup()
-{
+void setup(){
   Serial.begin(115200);
-  delay(300);
-  Serial.println("=== SLAVE STARTET ===");
-  Serial.printf("[Slave] Startwerte: CH=%d, TX=%d => %.2f dBm, SIZE=%d\n",
-                gChannel, gTxPower, 0.25f*gTxPower, gPaySize);
-
+  delay(120);
+  pinMode(RGB_BUILTIN,OUTPUT); neopixelWrite(RGB_BUILTIN,0,0,0);
+  Serial.printf("SLAVE Boot  CH=%d TX=%d SZ=%d\n",gChannel,gTxPower,gPaySize);
   WiFi.mode(WIFI_STA);
   esp_wifi_start();
-
-  applySlaveSettings();
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[Slave] ESP-NOW Init fehlgeschlagen.");
-    return;
-  }
-  esp_now_register_recv_cb(onDataRecv);
-
-  Serial.println("[Slave] Warte auf Broadcast-Handshakes...");
+  applyWiFi();
+  esp_now_init();
+  esp_now_register_recv_cb(onRecv);
 }
-
-void loop()
-{
-  // Der Slave tut sonst nichts; er lauscht auf onDataRecv.
-}
+void loop(){}
