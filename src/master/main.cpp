@@ -6,10 +6,10 @@
 
 #define SERIAL_BAUD 115200
 #define DEFAULT_CH 1
-#define DEFAULT_TXPWR 40    // 10 dBm
-#define ACK_TIMEOUT_MS    400  // für Config-ACK
-#define DONE_TIMEOUT_MS  1000  // für CONFIG_DONE
-#define TEST_TIMEOUT_MS 500 // für Test-Paket-ACKs
+#define DEFAULT_TXPWR 40     // 10 dBm
+#define ACK_TIMEOUT_MS 400   // für CONFIG_ACK
+#define DONE_TIMEOUT_MS 1000 // für CONFIG_DONE
+#define TEST_TIMEOUT_MS 500  // für Test-Paket-ACKs
 
 // ── State für Config-Wechsel ───────────────────────────
 enum ConfigState
@@ -32,7 +32,8 @@ static uint32_t gTotal = 1000;
 // ── Laufzeit-Zähler ─────────────────────────────────────
 static bool linkOK = false;
 static bool testRun = false;
-static bool debug = false; // <-- Debug-Flag
+static volatile bool scanning = false;
+static bool debug = false;
 static uint32_t txCnt = 0, rxCnt = 0;
 static bool waitingAck = false;
 static uint32_t lastTxMs = 0;
@@ -55,12 +56,9 @@ void ledRedBlink(uint32_t on, uint32_t off)
   static bool s;
   if (millis() - t > (s ? on : off))
   {
-    s = !s;
     t = millis();
-    if (s)
-      neopixelWrite(RGB_BUILTIN, 255, 0, 0);
-    else
-      ledOff();
+    s = !s;
+    neopixelWrite(RGB_BUILTIN, s ? 255 : 0, 0, 0);
   }
 }
 void ledGreenOnce()
@@ -73,9 +71,7 @@ void ledGreenTwice()
 {
   for (int i = 0; i < 2; i++)
   {
-    neopixelWrite(RGB_BUILTIN, 0, 255, 0);
-    delay(150);
-    ledOff();
+    ledGreenOnce();
     delay(100);
   }
 }
@@ -88,24 +84,18 @@ void applyWiFi(uint8_t ch, uint8_t tx)
 }
 
 // ── Konsolen-Macros ─────────────────────────────────────
-#define DPRINT(...)               \
-  do                              \
-  {                               \
-    if (debug)                    \
-      Serial.printf(__VA_ARGS__); \
-  } while (0)
-#define DPRINTLN(s)      \
-  do                     \
-  {                      \
-    if (debug)           \
-      Serial.println(s); \
-  } while (0)
+#define DPRINT(...) \
+  if (debug)        \
+  Serial.printf(__VA_ARGS__)
+#define DPRINTLN(s) \
+  if (debug)        \
+  Serial.println(s)
 
+// ── Hilfs-Funktionen ────────────────────────────────────
 void printLine()
 {
   Serial.println(F("----------------------------------------------------"));
 }
-
 void printHelp()
 {
   printLine();
@@ -119,18 +109,16 @@ void printHelp()
   Serial.println(F("   -sendpkg N     Pakete 1–99999"));
   Serial.println(F("   -reset         Neustart"));
   Serial.println(F("   -debug on/off  Debug-Ausgabe ein/aus"));
-  printLine();
 }
-
 void printCfg()
 {
   printLine();
-  Serial.printf("  Kanal:      %2u\n", gCh);
-  Serial.printf("  Tx-Power:   %2u (%.2f dBm)\n", gTx, 0.25f * gTx);
-  Serial.printf("  Nutzlast:   %3u B (+%u OH = %u B)\n", gSz, DATA_OVERHEAD, gSz + DATA_OVERHEAD);
-  Serial.printf("  Pakete:     %u\n", gTotal);
-  Serial.printf("  Slave:      %s\n", linkOK ? "verbunden" : "nicht verbunden");
-  Serial.printf("  Debug:      %s\n", debug ? "AN" : "aus");
+  Serial.printf("  Kanal:     %2u\n", gCh);
+  Serial.printf("  Tx-Power:  %2u (%.2f dBm)\n", gTx, 0.25f * gTx);
+  Serial.printf("  Nutzlast:  %3u B (+%u OH = %u B)\n", gSz, DATA_OVERHEAD, gSz + DATA_OVERHEAD);
+  Serial.printf("  Pakete:    %u\n", gTotal);
+  Serial.printf("  Slave:     %s\n", linkOK ? "verbunden" : "nicht verbunden");
+  Serial.printf("  Debug:     %s\n", debug ? "AN" : "aus");
 }
 
 // ── ESPNOW Sends ─────────────────────────────────────────
@@ -143,15 +131,10 @@ void sendHandshake()
   p.payload[2] = gSz & 0xFF;
   p.payload[3] = gSz >> 8;
   p.crc = computeCRC32((uint8_t *)&p, sizeof(p) - sizeof(p.crc));
-
   if (!debug)
-  {
     Serial.print(".");
-  }
   else
-  {
-    Serial.printf("⇆ [D] HS→All CH=%u TX=%u SZ=%u\n", gCh, gTx, gSz);
-  }
+    Serial.printf("[D] HS→All  CH=%u  TX=%u  SZ=%u\n", gCh, gTx, gSz);
   esp_now_send((uint8_t *)BC_ADDR, (uint8_t *)&p, sizeof(p));
 }
 
@@ -161,10 +144,12 @@ void sendConfig(PacketType type)
   ConfigPacket pkt = pendingCfg;
   pkt.type = (uint8_t)type;
   pkt.crc = computeCRC32((uint8_t *)&pkt, sizeof(pkt) - sizeof(pkt.crc));
-
-  Serial.printf("\n⇆ sendConfig(type=%u) on CH %u\n", (uint8_t)type, gCh);
-  DPRINT("    [D] ConfigPkt: ch=%u tx=%u sz=%u\n", pkt.channel, pkt.txPower, pkt.paySize);
-
+  // Klarer Text statt "type=3"
+  if (type == PACKET_TYPE_CONFIG)
+    Serial.printf("\n→ Sende CHANGE → CH=%u  TX=%u  SZ=%u\n", pkt.channel, pkt.txPower, pkt.paySize);
+  else
+    Serial.printf("→ Sende COMMIT → CH=%u  TX=%u  SZ=%u\n", pkt.channel, pkt.txPower, pkt.paySize);
+  DPRINT("    [D] raw-config: type=%u\n", (uint8_t)type);
   esp_now_send(slaveMac, (uint8_t *)&pkt, sizeof(pkt));
 }
 
@@ -176,16 +161,14 @@ void doTest()
   for (int i = 0; i < gSz; i++)
     p.payload[i] = uint8_t(p.id + i);
   p.crc = computeCRC32((uint8_t *)&p, sizeof(p) - sizeof(p.crc));
-
   applyWiFi(gCh, gTx);
   esp_err_t e = esp_now_send(slaveMac, (uint8_t *)&p, sizeof(p));
-  DPRINT("⇆ [D] TEST→Slave id=%u err=%d\n", p.id, e);
-
+  DPRINT("↔ [D] TEST→Slave id=%u err=%d\n", p.id, e);
   waitingAck = true;
   txCnt++;
   lastTxMs = millis();
 
-  // Fortschritt 2%-Schritte
+  // Fortschritt in 2%-Schritten
   static int lastPct = -1;
   int pct = (txCnt * 100) / gTotal;
   if (pct / 2 != lastPct / 2)
@@ -211,24 +194,19 @@ void onSend(const uint8_t *mac, esp_now_send_status_t st)
   if (cfgState == WAIT_COMMIT && st == ESP_OK)
   {
     cfgState = COMMIT_SENT;
-    lastCfgMs = millis();  // ← Uhr neu setzen für DONE-Timeout
-
-    Serial.println("\n✓ COMMIT bestätigt, übernehme Einstellungen…");
+    lastCfgMs = millis();
+    Serial.println("\n✓ COMMIT bestätigt, übernehme…");
     gCh = pendingCfg.channel;
     gTx = pendingCfg.txPower;
     gSz = pendingCfg.paySize;
     applyWiFi(gCh, gTx);
-
-    // Peer neu anlegen
     esp_now_del_peer(slaveMac);
     esp_now_peer_info_t pi{};
     memcpy(pi.peer_addr, slaveMac, 6);
     pi.channel = gCh;
     pi.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&pi);
-
-    Serial.printf("→ Neuer Channel: %u\n", gCh);
-    Serial.printf("→ Neue Tx-Power: %u (%.2f dBm)\n\n", gTx, 0.25f * gTx);
+    Serial.printf("  → CH=%u  TX=%u  SZ=%u\n", gCh, gTx, gSz);
     ledGreenTwice();
   }
 }
@@ -238,7 +216,6 @@ void recvCB(const uint8_t *mac, const uint8_t *data, int len)
   if (len <= 0)
     return;
   PacketType tp = (PacketType)data[0];
-
   switch (tp)
   {
   case PACKET_TYPE_HANDSHAKE_ACK:
@@ -253,12 +230,12 @@ void recvCB(const uint8_t *mac, const uint8_t *data, int len)
     pi.channel = gCh;
     pi.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&pi);
-
-    Serial.printf("\n");
+    Serial.println();
     printLine();
-    Serial.printf("✓ HS_ACK empfangen von Slave\n");
-    Serial.printf("✓ Channel=%u Power=%u Size=%u\n", p->payload[0], p->payload[1],
-                  p->payload[2] | (p->payload[3] << 8));
+    Serial.println("✓ HS_ACK von Slave");
+    Serial.printf("  → CH=%u  TX=%u  SZ=%u\n",
+                  p->payload[0], p->payload[1],
+                  (p->payload[2] | (p->payload[3] << 8)));
     printCfg();
     ledGreenOnce();
     break;
@@ -270,74 +247,73 @@ void recvCB(const uint8_t *mac, const uint8_t *data, int len)
     rssiSum += lastRSSI;
     rssiCnt++;
     waitingAck = false;
-    DPRINT("✓ [D] TEST-ACK id=%u RSSI=%d\n", p->id, lastRSSI);
+    DPRINT("✓ [D] TEST-ACK id=%u  RSSI=%d\n", p->id, lastRSSI);
     break;
   }
   case PACKET_TYPE_CONFIG_ACK:
+  {
+    if (cfgState == WAIT_ACK)
     {
-      if (cfgState == WAIT_ACK)
-      {
-        Serial.println("\n→ CONFIG_ACK empfangen");
-        // Unterschiedliche Ausgabe je nachdem was geändert wurde
-        if (pendingCfg.channel != gCh)
-        {
-          Serial.printf("   • Channel-Änderung bestätigt: %u\n", pendingCfg.channel);
-        }
-        else if (pendingCfg.txPower != gTx)
-        {
-          Serial.printf("   • Tx-Power-Änderung bestätigt: %u (%.2f dBm)\n",
-                        pendingCfg.txPower, 0.25f * pendingCfg.txPower);
-        }
-        else
-        {
-          Serial.println("   • Konfiguration bestätigt");
-        }
-        // COMMIT senden
-        sendConfig(PACKET_TYPE_CONFIG_COMMIT);
-        cfgState = WAIT_COMMIT;
-        lastCfgMs = millis();
-      }
-      break;
+      Serial.println("\n→ ACK für CHANGE empfangen");
+      if (pendingCfg.channel != gCh)
+        Serial.printf("  • Neu CH=%u\n", pendingCfg.channel);
+      if (pendingCfg.txPower != gTx)
+        Serial.printf("  • Neu TX=%u (%.2f dBm)\n",
+                      pendingCfg.txPower, 0.25f * pendingCfg.txPower);
+      if (pendingCfg.paySize != gSz)
+        Serial.printf("  • Neu SZ=%u B\n", pendingCfg.paySize);
+      sendConfig(PACKET_TYPE_CONFIG_COMMIT);
+      cfgState = WAIT_COMMIT;
+      lastCfgMs = millis();
     }
+    break;
+  }
   case PACKET_TYPE_CONFIG_DONE:
-    {
-      if (cfgState == COMMIT_SENT)
-      {
-        cfgState = IDLE;
-        Serial.println("✓ CONFIG_DONE empfangen, Sync vollständig");
-        printCfg();
-        ledGreenTwice();
-      }
-      break;
-    }
+  {
+    cfgState = IDLE;
+    Serial.println("✓ DONE empfangen, Sync OK");
+    printCfg();
+    ledGreenTwice();
+    break;
+  }
   default:
-    Serial.printf("⨯ Unbekannter Paket-Typ: %u\n", tp);
+    Serial.printf("⨯ UnbekannterPkt=%u\n", tp);
     break;
   }
 }
 
 // ── Endlos-Scan über alle Kanäle ─────────────────────────
 bool scanSlave() {
-  linkOK = false;
-  while (!linkOK) {
-    for (uint8_t ch = 1; ch <= 13 && !linkOK; ++ch) {
+  linkOK   = false;
+  scanning = true;             // Start-Flag
+  while (scanning && !linkOK) {
+    for (uint8_t ch = 1; ch <= 13 && scanning && !linkOK; ++ch) {
       gCh = ch;
-      // Scan-Header ohne automatische Zeilenumbrüche oder Punkte
       Serial.printf("⇆ Scanne CH %u ", ch);
-
       applyWiFi(gCh, gTx);
       uint32_t t0 = millis();
-      // In der Schleife sendHandshake() druckt jeweils einen Punkt "."
-      while (!linkOK && millis() - t0 < 800) {
+      while (scanning && !linkOK && millis() - t0 < 800) {
         sendHandshake();
         delay(200);
-      }
 
-      // Nach den Punkten einen sauberen Zeilenumbruch
+        // Seriellen Input kurz prüfen
+        if (Serial.available()) {
+          String in = Serial.readStringUntil('\n');
+          in.trim();
+          if (in.equalsIgnoreCase("-stop")) {
+            Serial.printf("\n→ Vorgang gestoppt\n");
+            scanning = false;
+            return false;
+          }
+          // falls du in Zukunft weitere Kommandos unterbrechen willst,
+          // ruf hier execCmd auf. Für jetzt: nur "-stop".
+        }
+      }
       Serial.println();
     }
   }
-  return true;
+  scanning = false;
+  return linkOK;
 }
 
 // ── Kommando-Parser ─────────────────────────────────────
@@ -359,7 +335,7 @@ void execCmd(const String &s)
   {
     if (!linkOK && !scanSlave())
     {
-      Serial.println("Kein Slave.");
+      Serial.println("Kein Slave");
       return;
     }
     testRun = true;
@@ -369,8 +345,9 @@ void execCmd(const String &s)
   }
   else if (cmd == "-stop")
   {
-    testRun = false;
-    Serial.println("→ Test gestoppt");
+    testRun  = false;
+    scanning = false;
+    Serial.println("→ Vorgang gestoppt");
     ledOff();
   }
   else if (cmd == "-reset")
@@ -396,7 +373,7 @@ void execCmd(const String &s)
       pendingCfg.txPower = gTx;
       pendingCfg.paySize = gSz;
       cfgState = WAIT_ACK;
-      Serial.printf("→ CFG send CH %u\n", v);
+      Serial.printf("→ CHANGE CH=%u\n", v);
       sendConfig(PACKET_TYPE_CONFIG);
       lastCfgMs = millis();
     }
@@ -410,7 +387,7 @@ void execCmd(const String &s)
       pendingCfg.txPower = v;
       pendingCfg.paySize = gSz;
       cfgState = WAIT_ACK;
-      Serial.printf("→ CFG send TX %u\n", v);
+      Serial.printf("→ CHANGE TX=%u\n", v);
       sendConfig(PACKET_TYPE_CONFIG);
       lastCfgMs = millis();
     }
@@ -424,7 +401,7 @@ void execCmd(const String &s)
       pendingCfg.txPower = gTx;
       pendingCfg.paySize = v;
       cfgState = WAIT_ACK;
-      Serial.printf("→ CFG send SZ %u\n", v);
+      Serial.printf("→ CHANGE SZ=%u\n", v);
       sendConfig(PACKET_TYPE_CONFIG);
       lastCfgMs = millis();
     }
@@ -435,7 +412,7 @@ void execCmd(const String &s)
     if (v >= 1 && v <= 99999)
     {
       gTotal = v;
-      Serial.printf("→ Pakete auf %u gesetzt\n", gTotal);
+      Serial.printf("→ Pakete auf %u\n", v);
     }
   }
 }
@@ -448,24 +425,20 @@ void setup()
   ledOff();
   printHelp();
   printCfg();
-
   WiFi.mode(WIFI_STA);
   esp_wifi_start();
   applyWiFi(gCh, gTx);
-
   esp_now_init();
   esp_now_register_send_cb(onSend);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(promiscCB);
   esp_now_register_recv_cb(recvCB);
-
   esp_now_peer_info_t bc{};
   memcpy(bc.peer_addr, BC_ADDR, 6);
   bc.channel = 0;
   bc.encrypt = false;
   bc.ifidx = WIFI_IF_STA;
   esp_now_add_peer(&bc);
-
   Serial.println("→ Suche Slave auf allen Kanälen…");
   scanSlave();
 }
@@ -478,26 +451,26 @@ void loop()
     if (l.length())
       execCmd(l);
   }
-  // Config-Retry
+  // Retry CONFIG_ACK
   if (cfgState == WAIT_ACK && millis() - lastCfgMs > ACK_TIMEOUT_MS)
   {
-    Serial.println("⨯ ACK-Timeout, retry CONFIG");
+    Serial.println("⨯ ACK-Timeout, sende CHANGE erneut");
     sendConfig(PACKET_TYPE_CONFIG);
     lastCfgMs = millis();
   }
-  // Retry COMMIT / CONFIG_DONE
-  if (cfgState == COMMIT_SENT && millis() - lastCfgMs > DONE_TIMEOUT_MS)
+  // Retry COMMIT / DONE solange nicht IDLE
+  if ((cfgState == WAIT_COMMIT || cfgState == COMMIT_SENT) && millis() - lastCfgMs > DONE_TIMEOUT_MS)
   {
-    Serial.println("⨯ CONFIG_DONE-Timeout, sende COMMIT erneut");
+    Serial.println("⨯ DONE-Timeout, sende COMMIT erneut");
     sendConfig(PACKET_TYPE_CONFIG_COMMIT);
-    lastCfgMs = millis();  // und Uhr wieder neu setzen
+    cfgState = WAIT_COMMIT;
+    lastCfgMs = millis();
   }
   // Test-Loop
   if (testRun)
   {
     ledRedBlink(400, 400);
     doTest();
-    // Paket-Timeout
     if (waitingAck && millis() - lastTxMs > TEST_TIMEOUT_MS)
     {
       waitingAck = false;
@@ -506,7 +479,6 @@ void loop()
       ledOff();
       Serial.printf("\n! Timeout Paket %u\n", txCnt);
     }
-    // Ende
     if (txCnt == gTotal && !waitingAck)
     {
       float loss = 100.0f * (txCnt - rxCnt) / txCnt;
@@ -520,7 +492,5 @@ void loop()
     }
   }
   else
-  {
     ledOff();
-  }
 }
