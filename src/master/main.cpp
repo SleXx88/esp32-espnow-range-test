@@ -61,18 +61,58 @@ void ledRedBlink(uint32_t on, uint32_t off)
     neopixelWrite(RGB_BUILTIN, s ? 255 : 0, 0, 0);
   }
 }
+
+// ── Non-blocking green blink handling ────────────────────
+static uint8_t  gGreenCount = 0;      // remaining flashes
+static bool     gGreenOn = false;     // LED currently on?
+static uint32_t gGreenMs = 0;         // timestamp of last change
+
 void ledGreenOnce()
 {
+  gGreenCount = 1;
+  gGreenOn = true;
+  gGreenMs = millis();
   neopixelWrite(RGB_BUILTIN, 0, 255, 0);
-  delay(150);
-  ledOff();
 }
+
 void ledGreenTwice()
 {
-  for (int i = 0; i < 2; i++)
+  gGreenCount = 2;
+  gGreenOn = true;
+  gGreenMs = millis();
+  neopixelWrite(RGB_BUILTIN, 0, 255, 0);
+}
+
+static void updateGreenBlink()
+{
+  if (gGreenCount == 0)
+    return;
+
+  uint32_t now = millis();
+  if (gGreenOn)
   {
-    ledGreenOnce();
-    delay(100);
+    if (now - gGreenMs >= 150)
+    {
+      gGreenMs = now;
+      gGreenOn = false;
+      neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    }
+  }
+  else
+  {
+    if (now - gGreenMs >= 100)
+    {
+      gGreenMs = now;
+      if (--gGreenCount)
+      {
+        gGreenOn = true;
+        neopixelWrite(RGB_BUILTIN, 0, 255, 0);
+      }
+      else
+      {
+        neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+      }
+    }
   }
 }
 
@@ -451,6 +491,8 @@ void loop()
     if (l.length())
       execCmd(l);
   }
+
+  updateGreenBlink();
   // Retry CONFIG_ACK
   if (cfgState == WAIT_ACK && millis() - lastCfgMs > ACK_TIMEOUT_MS)
   {
@@ -491,6 +533,6 @@ void loop()
       ledOff();
     }
   }
-  else
+  else if (gGreenCount == 0)
     ledOff();
 }
